@@ -8,6 +8,9 @@ import test from "node:test";
 import { z } from "zod";
 
 const execFileAsync = promisify(execFile);
+// npm is a .cmd shim on Windows, which Node only runs through a shell.
+const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const npmOptions = (cwd: string) => ({ cwd, shell: process.platform === "win32" });
 const packReportSchema = z.object({
 	filename: z.string(),
 	files: z.array(z.object({ path: z.string() })),
@@ -26,8 +29,9 @@ test("packed package installs and starts from a plain npm consumer", async () =>
 			recursive: true,
 			filter: (entry) => ![".git", "dist", "node_modules"].includes(path.relative(projectRoot, entry).split(path.sep)[0]),
 		});
-		await symlink(path.join(projectRoot, "node_modules"), path.join(sourceRoot, "node_modules"), "dir");
-		const { stdout } = await execFileAsync("npm", ["pack", "--json", "--pack-destination", root], { cwd: sourceRoot });
+		// A junction needs no symlink privilege on Windows.
+		await symlink(path.join(projectRoot, "node_modules"), path.join(sourceRoot, "node_modules"), process.platform === "win32" ? "junction" : "dir");
+		const { stdout } = await execFileAsync(npm, ["pack", "--json", "--pack-destination", root], npmOptions(sourceRoot));
 		const parsedReport = packOutputSchema.parse(JSON.parse(stdout));
 		const report = Array.isArray(parsedReport) ? parsedReport[0] : Object.values(parsedReport)[0];
 		assert.ok(report);
@@ -47,7 +51,7 @@ test("packed package installs and starts from a plain npm consumer", async () =>
 		const consumer = path.join(root, "consumer");
 		await mkdir(consumer);
 		await writeFile(path.join(consumer, "package.json"), '{"private":true}\n');
-		await execFileAsync("npm", ["install", "--no-audit", "--no-fund", path.join(root, report.filename)], { cwd: consumer });
+		await execFileAsync(npm, ["install", "--no-audit", "--no-fund", path.join(root, report.filename)], npmOptions(consumer));
 
 		const installedRoot = path.join(consumer, "node_modules", "codex-computer-use-mcp");
 		const installedPackage = JSON.parse(await readFile(path.join(installedRoot, "package.json"), "utf8"));
