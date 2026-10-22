@@ -55,7 +55,8 @@ await tools.computer_use_type_text({ window, text: "hello" });
 list_apps resolves to { apps } and list_windows to { windows }. A window is { app, id, title }; pass it unchanged as the window argument of later calls, and use launch_app for an app without an open window.
 get_window_state resolves to { window, accessibility, screenshots }. accessibility.tree is the indexed element tree when include_text is true; each screenshot carries an image block for image() plus its id, size and origin. Take element_index values from the latest get_window_state, and inspect again after acting.
 scroll takes a window-relative x, y start point and scrollX, scrollY deltas. press_key uses keysym names such as Return, Tab or Control_L+a.
-Calls run one at a time, in the order the script makes them. The first use of an app asks for approval in Pi. A failed call rejects with the official error text.`,
+Calls run one at a time, in the order the script makes them. The first use of an app asks for approval in Pi. A failed call rejects with the official error text.
+Computer Use holds the desktop during a turn, which ends when the agent settles or after 15 s without calls; element indexes are valid within one turn, so inspect again before acting after a pause.`,
 };
 
 export function computerUseNamespace(platform: ComputerUsePlatform): ToolNamespace {

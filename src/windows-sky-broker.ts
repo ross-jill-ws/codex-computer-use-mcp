@@ -32,12 +32,26 @@ export const WINDOWS_HELPER_RELATIVE_PATH = path.join(
 	process.arch === "arm64" ? "codex-computer-use-arm64.exe" : "codex-computer-use.exe",
 );
 const CLIENT_MODULE_RELATIVE_PATH = "dist/project/cua/sky_js/src/targets/windows/internal/computer_use_client.js";
+const TRANSPORT_MODULE_RELATIVE_PATH = "dist/project/cua/sky_js/src/targets/windows/internal/helper_transport.js";
+// A helper turn shows the official "ChatGPT is using your computer" overlay and
+// locks the user's input until the turn ends; element indexes are valid only
+// within a turn. Codex ends the turn with the model's turn. Pi closes the session
+// when the agent settles; for MCP clients the broker ends an idle turn after this
+// long, which must exceed a model's pause between an inspection and its action.
+const DEFAULT_TURN_IDLE_MS = 15_000;
+const TURN_IDLE_ENV = "CODEX_COMPUTER_USE_TURN_IDLE_MS";
+
+function configuredTurnIdleMs(): number {
+	const configured = z.coerce.number().int().positive().safeParse(process.env[TURN_IDLE_ENV]);
+	return configured.success ? configured.data : DEFAULT_TURN_IDLE_MS;
+}
 const OPENAI_SIGNER_ORGANIZATION = "OpenAI OpCo, LLC";
 const POWERSHELL_PATH = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 
 const jsonObjectSchema = z.record(z.string(), z.json());
 const skyManifestSchema = z.object({ name: z.literal(SKY_PACKAGE_NAME), version: z.string().min(1) });
 const clientModuleSchema = z.object({ WindowsComputerUseClient: z.instanceof(Function) });
+const transportModuleSchema = z.object({ WindowsHelperTransport: z.instanceof(Function) });
 const approvalRequestSchema = z.object({
 	message: z.string().optional(),
 	meta: jsonObjectSchema.optional(),
@@ -205,25 +219,54 @@ export function verifyOfficialWindowsBroker(options: ResolveOfficialWindowsClien
 export type WindowsSkyClient = { close(): Promise<void> }
 	& Record<WindowsDirectMethod, (input: DirectToolArguments) => Promise<JsonValue>>;
 
-type WindowsSkyClientConstructor = new (options: { helperPath: string; timeoutMs?: number }) => WindowsSkyClient;
+/** The official helper transport surface this broker uses. */
+export interface WindowsSkyTransport {
+	request(method: string, params: JsonObject, options?: { codexTurnMetadata?: JsonObject }): Promise<JsonValue>;
+	close(): Promise<void>;
+}
+
+/** The official client plus the turn control that only its transport exposes. */
+export interface WindowsSkyRuntime {
+	client: WindowsSkyClient;
+	endTurn(turnMeta: JsonObject): Promise<void>;
+}
+
+type WindowsSkyTransportConstructor = new (options: { helperCommand: string; helperArgs: string[]; timeoutMs?: number }) => WindowsSkyTransport;
+type WindowsSkyClientConstructor = new (options: { transport: WindowsSkyTransport }) => WindowsSkyClient;
 
 export interface WindowsBrokerOptions extends Pick<DirectBrokerOptions, "timeoutMs" | "signal" | "onElicitation" | "supportsOpenAiFormElicitation" | "configPath"> {
 	/** Test-only signature bypass. */
 	skipSignatureVerification?: boolean;
-	/** Test-only client factory, used only with skipSignatureVerification. */
-	loadClient?: () => Promise<WindowsSkyClient>;
+	/** Test-only runtime factory, used only with skipSignatureVerification. */
+	loadRuntime?: () => Promise<WindowsSkyRuntime>;
+	/** Test-only idle period before the helper turn ends. */
+	turnIdleMs?: number;
 }
 
-async function loadOfficialClient(client: OfficialWindowsClient): Promise<WindowsSkyClient> {
-	const moduleUrl = pathToFileURL(path.join(client.packagePath, CLIENT_MODULE_RELATIVE_PATH)).href;
-	const loaded = clientModuleSchema.safeParse(await import(moduleUrl));
-	if (!loaded.success) {
+async function loadOfficialRuntime(client: OfficialWindowsClient): Promise<WindowsSkyRuntime> {
+	const moduleUrl = (relativePath: string) => pathToFileURL(path.join(client.packagePath, relativePath)).href;
+	const transportModule = transportModuleSchema.safeParse(await import(moduleUrl(TRANSPORT_MODULE_RELATIVE_PATH)));
+	const clientModule = clientModuleSchema.safeParse(await import(moduleUrl(CLIENT_MODULE_RELATIVE_PATH)));
+	if (!transportModule.success || !clientModule.success) {
 		throw new BrokerVerificationError(`The official ${SKY_PACKAGE_NAME} package does not export the Windows Computer Use client`);
 	}
-	// SAFETY: the verified official module exports its WindowsComputerUseClient class, checked above to be a constructor function.
-	const WindowsComputerUseClient = loaded.data.WindowsComputerUseClient as WindowsSkyClientConstructor;
-	// helperPath, not helperCommand: the official client then adds its own --parent-pid argument.
-	return new WindowsComputerUseClient({ helperPath: client.clientPath, timeoutMs: 60_000 });
+	// SAFETY: the verified official module exports its helper transport class, checked above to be a constructor function.
+	const WindowsHelperTransport = transportModule.data.WindowsHelperTransport as WindowsSkyTransportConstructor;
+	// SAFETY: the verified official module exports its client class, checked above to be a constructor function.
+	const WindowsComputerUseClient = clientModule.data.WindowsComputerUseClient as WindowsSkyClientConstructor;
+	// Owning the transport is what allows end_turn. The client adds --parent-pid
+	// only to a helper it starts itself, so pass it here: the helper exits with this process.
+	const transport = new WindowsHelperTransport({
+		helperCommand: client.clientPath,
+		helperArgs: ["--parent-pid", String(process.pid)],
+		timeoutMs: 60_000,
+	});
+	return {
+		client: new WindowsComputerUseClient({ transport }),
+		async endTurn(turnMeta) {
+			await transport.request("end_turn", {}, { codexTurnMetadata: turnMeta });
+		},
+	};
 }
 
 // The official client reads app-approval and turn metadata from Codex's node_repl
@@ -372,28 +415,56 @@ export async function createOfficialWindowsToolSession(options: WindowsBrokerOpt
 		? { brokerVersion: "test-sky", clientBuild: "test-helper", client: undefined }
 		: verifyOfficialWindowsBroker({ configPath: options.configPath });
 	const evidence = { brokerVersion: verification.brokerVersion, clientBuild: verification.clientBuild };
-	let client: WindowsSkyClient;
-	const turnMeta: JsonObject = { session_id: randomUUID(), turn_id: randomUUID() };
+	let runtime: WindowsSkyRuntime;
+	const sessionId = randomUUID();
+	let turnMeta: JsonObject = { session_id: sessionId, turn_id: randomUUID() };
 	try {
 		installNodeReplHostShim();
 		nodeReplHostShim.requestMeta = turnMeta;
-		if (options.loadClient) client = await options.loadClient();
-		else if (verification.client) client = await loadOfficialClient(verification.client);
+		if (options.loadRuntime) runtime = await options.loadRuntime();
+		else if (verification.client) runtime = await loadOfficialRuntime(verification.client);
 		else throw new BrokerVerificationError("The official Windows Computer Use client was not verified");
 	} catch (error) {
 		const primary = error instanceof Error ? error : new Error(String(error));
 		throw new DirectBrokerCallError(primary.message, true, primary, evidence);
 	}
+	const client = runtime.client;
 
 	let fatalError: Error | undefined;
 	let closed = false;
 	let closePromise: Promise<void> | undefined;
 	let callActive = false;
+	let turnActive = false;
+	let turnTimer: NodeJS.Timeout | undefined;
+	let turnEnding: Promise<void> | undefined;
+
+	const clearTurnTimer = (): void => {
+		if (turnTimer) clearTimeout(turnTimer);
+		turnTimer = undefined;
+	};
+	// Ends the current helper turn, which removes the official overlay and gives the
+	// user their input back. The next call starts a new turn under a new turn id.
+	const endTurn = (): Promise<void> => {
+		clearTurnTimer();
+		if (!turnActive) return turnEnding ?? Promise.resolve();
+		turnActive = false;
+		const ended = turnMeta;
+		turnMeta = { session_id: sessionId, turn_id: randomUUID() };
+		turnEnding = runtime.endTurn(ended).catch(() => undefined).finally(() => { turnEnding = undefined; });
+		return turnEnding;
+	};
+	const scheduleTurnEnd = (): void => {
+		clearTurnTimer();
+		turnTimer = setTimeout(() => { void endTurn(); }, options.turnIdleMs ?? configuredTurnIdleMs());
+		turnTimer.unref();
+	};
 
 	const close = (): Promise<void> => {
 		closePromise ??= (async () => {
 			closed = true;
 			activeApproval = undefined;
+			clearTurnTimer();
+			if (turnEnding) await turnEnding;
 			try {
 				await new Promise<void>((resolve, reject) => {
 					const timer = setTimeout(() => reject(new Error("Official Windows Computer Use helper did not close")), 5_000);
@@ -443,6 +514,9 @@ export async function createOfficialWindowsToolSession(options: WindowsBrokerOpt
 				throw new DirectBrokerCallError(`The official Windows Computer Use client does not provide ${method}`, true, undefined, evidence);
 			}
 			callActive = true;
+			clearTurnTimer();
+			if (turnEnding) await turnEnding;
+			turnActive = true;
 			let elicitationRequests = 0;
 			nodeReplHostShim.requestMeta = approvedRequestMeta(turnMeta, args);
 			activeApproval = async (request) => {
@@ -476,6 +550,7 @@ export async function createOfficialWindowsToolSession(options: WindowsBrokerOpt
 			} finally {
 				activeApproval = undefined;
 				callActive = false;
+				if (!closed && !fatalError) scheduleTurnEnd();
 			}
 		},
 		close,

@@ -13,6 +13,7 @@ import {
 	createOfficialWindowsToolSession,
 	windowsResultContent,
 	type WindowsSkyClient,
+	type WindowsSkyRuntime,
 } from "../src/windows-sky-broker.ts";
 import type { WindowsDirectMethod } from "../src/windows-tools.ts";
 
@@ -49,11 +50,13 @@ function fakeClient(overrides: Partial<WindowsSkyClient> = {}) {
 		activate_window: record("activate_window"),
 		...overrides,
 	};
-	return { client, calls, closed: () => closed };
+	const turnsEnded: JsonObject[] = [];
+	const runtime: WindowsSkyRuntime = { client, async endTurn(turnMeta) { turnsEnded.push(turnMeta); } };
+	return { client, runtime, calls, turnsEnded, closed: () => closed };
 }
 
-function testSession(client: WindowsSkyClient) {
-	return createOfficialWindowsToolSession({ skipSignatureVerification: true, loadClient: async () => client });
+function testSession(runtime: WindowsSkyRuntime, turnIdleMs = 50) {
+	return createOfficialWindowsToolSession({ skipSignatureVerification: true, loadRuntime: async () => runtime, turnIdleMs });
 }
 
 interface NodeReplHost {
@@ -67,8 +70,8 @@ function nodeReplHost(): NodeReplHost {
 }
 
 test("Windows session calls the official client with the caller's arguments and returns the official result", async () => {
-	const { client, calls, closed } = fakeClient();
-	const session = await testSession(client);
+	const { runtime, calls, closed } = fakeClient();
+	const session = await testSession(runtime);
 	const apps = await session.call("list_apps", {});
 	assert.equal(apps.isError, false);
 	assert.equal(apps.modelTurnsStarted, 0);
@@ -104,13 +107,13 @@ test("official app approvals reach the caller as elicitations and the response r
 		message: "Allow Codex to use Notepad?",
 		meta: { codex_approval_kind: "mcp_tool_call", persist: ["session", "always"], tool_params: { app: "notepad.exe" } },
 	};
-	const { client } = fakeClient({
+	const { runtime } = fakeClient({
 		get_window_state: async (args) => {
 			received = await nodeReplHost().createElicitation(approval);
 			return { window: args.window ?? null, screenshots: [], accessibility: null };
 		},
 	});
-	const session = await testSession(client);
+	const session = await testSession(runtime);
 	const requests: DirectBrokerElicitationRequest[] = [];
 	const result = await session.call("get_window_state", { window }, {
 		onElicitation: async (request) => {
@@ -131,7 +134,7 @@ test("official app approvals reach the caller as elicitations and the response r
 	assert.deepEqual(received, { action: "accept", content: { persist: "always" } });
 	await session.close();
 
-	const headless = await testSession(client);
+	const headless = await testSession(runtime);
 	await headless.call("get_window_state", { window });
 	assert.deepEqual(received, { action: "cancel" });
 	await headless.close();
@@ -140,7 +143,7 @@ test("official app approvals reach the caller as elicitations and the response r
 test("session approvals are remembered and marked on later requests for the same app", async () => {
 	const notepadApp = "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App";
 	const asked: string[] = [];
-	const { client } = fakeClient({
+	const { runtime } = fakeClient({
 		get_window_state: async (args) => {
 			const host = nodeReplHost();
 			const target = z.object({ window: z.object({ app: z.string() }) }).parse(args).window.app;
@@ -155,7 +158,7 @@ test("session approvals are remembered and marked on later requests for the same
 			return { window: args.window ?? null, screenshots: [], accessibility: null };
 		},
 	});
-	const session = await testSession(client);
+	const session = await testSession(runtime);
 	const approve = async () => ({ action: "accept" as const, content: { persist: "session" } });
 	const first = await session.call("get_window_state", { window: { app: notepadApp, id: 1 } }, { onElicitation: approve });
 	assert.equal(first.isError, false);
@@ -171,7 +174,7 @@ test("session approvals are remembered and marked on later requests for the same
 	await session.close();
 
 	// Session approvals outlive one helper session: the next session does not ask again.
-	const next = await testSession(client);
+	const next = await testSession(runtime);
 	const later = await next.call("get_window_state", { window: { app: notepadApp, id: 1 } }, {
 		onElicitation: async () => { throw new Error("an approved app must not be asked again"); },
 	});
@@ -180,11 +183,11 @@ test("session approvals are remembered and marked on later requests for the same
 });
 
 test("helper rejections are official errors while helper exits are broker failures", async () => {
-	const { client, closed } = fakeClient({
+	const { runtime, closed } = fakeClient({
 		click: async () => { throw new Error("Computer Use was not approved to use Notepad"); },
 		list_apps: async () => { throw new Error("computer-use helper exited with exit code 1"); },
 	});
-	const session = await testSession(client);
+	const session = await testSession(runtime);
 	const denied = await session.call("click", { window, x: 1, y: 1 });
 	assert.equal(denied.isError, true);
 	assert.deepEqual(denied.content, [{ type: "text", text: "Computer Use was not approved to use Notepad" }]);
@@ -195,8 +198,8 @@ test("helper rejections are official errors while helper exits are broker failur
 
 test("cancellation closes the helper and rejects the pending call", async () => {
 	const controller = new AbortController();
-	const { client, closed } = fakeClient({ get_window_state: () => new Promise<JsonValue>(() => undefined) });
-	const session = await testSession(client);
+	const { runtime, closed } = fakeClient({ get_window_state: () => new Promise<JsonValue>(() => undefined) });
+	const session = await testSession(runtime);
 	const pending = session.call("get_window_state", { window }, { signal: controller.signal });
 	controller.abort();
 	await assert.rejects(pending, /cancelled/);
@@ -205,11 +208,34 @@ test("cancellation closes the helper and rejects the pending call", async () => 
 });
 
 test("one-shot Windows calls close the helper and report verified cleanup", async () => {
-	const { client, closed } = fakeClient();
-	const result = await callOfficialWindowsTool("list_apps", {}, { skipSignatureVerification: true, loadClient: async () => client });
+	const { runtime, closed } = fakeClient();
+	const result = await callOfficialWindowsTool("list_apps", {}, { skipSignatureVerification: true, loadRuntime: async () => runtime });
 	assert.equal(result.isError, false);
 	assert.equal(result.brokerCleanupVerified, true);
 	assert.equal(closed(), 1);
+});
+
+test("the helper turn ends after the idle period and later calls start a new turn", async () => {
+	const fake = fakeClient();
+	const session = await testSession(fake.runtime, 30);
+	await session.call("list_windows", {});
+	await session.call("list_windows", {});
+	assert.equal(fake.turnsEnded.length, 0, "consecutive calls share one turn");
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	assert.equal(fake.turnsEnded.length, 1);
+	const first = fake.turnsEnded[0];
+	assert.match(String(first.turn_id), /^[0-9a-f-]{36}$/);
+	await session.call("list_windows", {});
+	const meta = nodeReplHost().requestMeta;
+	assert.equal(meta.session_id, first.session_id);
+	assert.notEqual(meta.turn_id, first.turn_id);
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	assert.equal(fake.turnsEnded.length, 2);
+	await session.call("list_windows", {});
+	await session.close();
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	assert.equal(fake.turnsEnded.length, 2, "closing the helper ends its turn without a separate end_turn");
+	assert.equal(fake.closed(), 1);
 });
 
 test("approval and result conversion tolerate minimal official payloads", () => {
