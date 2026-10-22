@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -296,20 +296,62 @@ function installNodeReplHostShim(): void {
 	}
 }
 
-// Codex's node_repl host remembers session approvals and marks later requests for
-// that app as approved; without the mark the helper asks on every request. This
-// process keeps the same memory for its lifetime, which is the Pi or MCP session.
+// The host, not the helper, remembers approvals: Codex's node_repl marks later
+// requests for an approved app with the helper's own app id (chrome.exe), which
+// differs from the window's app field (Chrome, process:C:\...\chrome.exe) for
+// most apps, and Codex persists "always" answers in its config. This process keeps
+// session approvals for its lifetime and "always" approvals in the state directory.
 const APPROVED_APP_META_KEY = "x-oai-cua-approved-app";
-const sessionApprovedApps = new Set<string>();
+const APPROVALS_FILE_NAME = "windows-approvals.json";
 const approvalAppSchema = z.object({ meta: z.object({ tool_params: z.object({ app: z.string().min(1) }) }) });
+const approvalPersistSchema = z.object({ content: z.object({ persist: z.string() }) });
 const callTargetSchema = z.union([
 	z.object({ window: z.object({ app: z.string().min(1) }) }).transform((value) => value.window.app),
 	z.object({ app: z.string().min(1) }).transform((value) => value.app),
 ]);
+const approvalsFileSchema = z.object({ version: z.literal(1), approvals: z.record(z.string(), z.string().min(1)) });
 
-function approvedRequestMeta(turnMeta: JsonObject, args: DirectToolArguments): JsonObject {
-	const target = callTargetSchema.safeParse(args);
-	return target.success && sessionApprovedApps.has(target.data) ? { ...turnMeta, [APPROVED_APP_META_KEY]: target.data } : turnMeta;
+/** Call targets (window.app, launch_app's app, the helper id itself) mapped to the helper's approved app id. */
+const sessionApprovals = new Map<string, string>();
+
+function approvalsFile(configPath: string | undefined): string | undefined {
+	return configPath ? path.join(path.dirname(configPath), APPROVALS_FILE_NAME) : undefined;
+}
+
+function readPersistedApprovals(file: string | undefined): Map<string, string> {
+	if (!file || !existsSync(file)) return new Map();
+	try {
+		const parsed = approvalsFileSchema.safeParse(JSON.parse(readFileSync(file, "utf8")));
+		return parsed.success ? new Map(Object.entries(parsed.data.approvals)) : new Map();
+	} catch {
+		return new Map();
+	}
+}
+
+function writePersistedApprovals(file: string, approvals: Map<string, string>): void {
+	mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	writeFileSync(file, `${JSON.stringify({ version: 1, approvals: Object.fromEntries(approvals) }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function approvedAppFor(target: string | undefined, persisted: Map<string, string>): string | undefined {
+	if (target === undefined) return undefined;
+	return sessionApprovals.get(target) ?? persisted.get(target);
+}
+
+function rememberApproval(target: string | undefined, app: string, persist: string, file: string | undefined, persisted: Map<string, string>): void {
+	for (const key of target === undefined ? [app] : [target, app]) sessionApprovals.set(key, app);
+	if (persist !== "always" || !file) return;
+	for (const key of target === undefined ? [app] : [target, app]) persisted.set(key, app);
+	try {
+		writePersistedApprovals(file, persisted);
+	} catch {
+		// The approval still holds for this process.
+	}
+}
+
+/** Test-only: forget session approvals. */
+export function clearSessionApprovals(): void {
+	sessionApprovals.clear();
 }
 
 export function approvalElicitation(request: JsonValue): DirectBrokerElicitationRequest {
@@ -429,6 +471,8 @@ export async function createOfficialWindowsToolSession(options: WindowsBrokerOpt
 		throw new DirectBrokerCallError(primary.message, true, primary, evidence);
 	}
 	const client = runtime.client;
+	const persistedApprovalsFile = approvalsFile(options.configPath);
+	const persistedApprovals = readPersistedApprovals(persistedApprovalsFile);
 
 	let fatalError: Error | undefined;
 	let closed = false;
@@ -518,7 +562,10 @@ export async function createOfficialWindowsToolSession(options: WindowsBrokerOpt
 			if (turnEnding) await turnEnding;
 			turnActive = true;
 			let elicitationRequests = 0;
-			nodeReplHostShim.requestMeta = approvedRequestMeta(turnMeta, args);
+			const target = callTargetSchema.safeParse(args);
+			const callTarget = target.success ? target.data : undefined;
+			const approvedApp = approvedAppFor(callTarget, persistedApprovals);
+			nodeReplHostShim.requestMeta = approvedApp === undefined ? turnMeta : { ...turnMeta, [APPROVED_APP_META_KEY]: approvedApp };
 			activeApproval = async (request) => {
 				elicitationRequests += 1;
 				let response: DirectBrokerElicitationResponse = { action: "cancel" };
@@ -528,9 +575,8 @@ export async function createOfficialWindowsToolSession(options: WindowsBrokerOpt
 				}
 				const approved = approvalAppSchema.safeParse(request);
 				if (response.action === "accept" && approved.success) {
-					sessionApprovedApps.add(approved.data.meta.tool_params.app);
-					const target = callTargetSchema.safeParse(args);
-					if (target.success) sessionApprovedApps.add(target.data);
+					const persist = approvalPersistSchema.safeParse(response);
+					rememberApproval(callTarget, approved.data.meta.tool_params.app, persist.success ? persist.data.content.persist : "session", persistedApprovalsFile, persistedApprovals);
 				}
 				return response;
 			};

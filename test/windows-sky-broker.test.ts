@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { z } from "zod";
 import {
@@ -10,6 +13,7 @@ import type { DirectToolArguments, JsonObject, JsonValue } from "../src/tools.ts
 import {
 	approvalElicitation,
 	callOfficialWindowsTool,
+	clearSessionApprovals,
 	createOfficialWindowsToolSession,
 	windowsResultContent,
 	type WindowsSkyClient,
@@ -140,46 +144,88 @@ test("official app approvals reach the caller as elicitations and the response r
 	await headless.close();
 });
 
-test("session approvals are remembered and marked on later requests for the same app", async () => {
-	const notepadApp = "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App";
+// The helper names apps by its own id (chrome.exe); windows name them differently.
+const helperAppIds = new Map([
+	["Chrome", "chrome.exe"],
+	["process:E:\\apps\\electron\\electron.exe", "electron.exe"],
+	["Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"],
+]);
+
+function approvingClient() {
 	const asked: string[] = [];
-	const { runtime } = fakeClient({
+	const fake = fakeClient({
 		get_window_state: async (args) => {
 			const host = nodeReplHost();
 			const target = z.object({ window: z.object({ app: z.string() }) }).parse(args).window.app;
-			if (host.requestMeta["x-oai-cua-approved-app"] !== target) {
-				asked.push(target);
+			const helperApp = helperAppIds.get(target) ?? target;
+			if (host.requestMeta["x-oai-cua-approved-app"] !== helperApp) {
+				asked.push(helperApp);
 				const answer = await host.createElicitation({
-					message: `Allow Codex to use ${target}?`,
-					meta: { codex_approval_kind: "mcp_tool_call", persist: ["session", "always"], tool_params: { app: target } },
+					message: `Allow Codex to use ${helperApp}?`,
+					meta: { codex_approval_kind: "mcp_tool_call", persist: ["session", "always"], tool_params: { app: helperApp } },
 				});
-				if (answer.action !== "accept") throw new Error(`Computer Use was not approved to use ${target}`);
+				if (answer.action !== "accept") throw new Error(`Computer Use was not approved to use ${helperApp}`);
 			}
 			return { window: args.window ?? null, screenshots: [], accessibility: null };
 		},
 	});
+	return { ...fake, asked };
+}
+
+const neverAsk = async (): Promise<DirectBrokerElicitationResponse> => { throw new Error("an approved app must not be asked again"); };
+
+test("session approvals mark later requests with the helper's own app id", async () => {
+	clearSessionApprovals();
+	const { runtime, asked } = approvingClient();
 	const session = await testSession(runtime);
 	const approve = async () => ({ action: "accept" as const, content: { persist: "session" } });
-	const first = await session.call("get_window_state", { window: { app: notepadApp, id: 1 } }, { onElicitation: approve });
+	const chrome = { app: "Chrome", id: 1 };
+	const electron = { app: "process:E:\\apps\\electron\\electron.exe", id: 2 };
+	const first = await session.call("get_window_state", { window: chrome }, { onElicitation: approve });
 	assert.equal(first.isError, false);
 	assert.equal(first.elicitationRequests, 1);
-	const second = await session.call("get_window_state", { window: { app: notepadApp, id: 1 } }, {
-		onElicitation: async () => { throw new Error("an approved app must not be asked again"); },
-	});
+	const second = await session.call("get_window_state", { window: chrome }, { onElicitation: neverAsk });
 	assert.equal(second.isError, false);
 	assert.equal(second.elicitationRequests, 0);
-	const declined = await session.call("get_window_state", { window: { app: "other.exe", id: 2 } }, { onElicitation: async () => ({ action: "decline" }) });
+	assert.equal(nodeReplHost().requestMeta["x-oai-cua-approved-app"], "chrome.exe");
+	await session.call("get_window_state", { window: electron }, { onElicitation: approve });
+	const electronAgain = await session.call("get_window_state", { window: electron }, { onElicitation: neverAsk });
+	assert.equal(electronAgain.elicitationRequests, 0);
+	const declined = await session.call("get_window_state", { window: { app: "other.exe", id: 3 } }, { onElicitation: async () => ({ action: "decline" }) });
 	assert.equal(declined.isError, true);
-	assert.deepEqual(asked, [notepadApp, "other.exe"]);
+	assert.deepEqual(asked, ["chrome.exe", "electron.exe", "other.exe"]);
 	await session.close();
 
 	// Session approvals outlive one helper session: the next session does not ask again.
 	const next = await testSession(runtime);
-	const later = await next.call("get_window_state", { window: { app: notepadApp, id: 1 } }, {
-		onElicitation: async () => { throw new Error("an approved app must not be asked again"); },
-	});
+	const later = await next.call("get_window_state", { window: chrome }, { onElicitation: neverAsk });
 	assert.equal(later.elicitationRequests, 0);
 	await next.close();
+});
+
+test("always approvals persist in the state directory and survive a new process", async () => {
+	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "windows-approvals-test."));
+	const configPath = path.join(stateRoot, "config.json");
+	try {
+		clearSessionApprovals();
+		const { runtime } = approvingClient();
+		const session = await createOfficialWindowsToolSession({ skipSignatureVerification: true, loadRuntime: async () => runtime, turnIdleMs: 50, configPath });
+		const chrome = { app: "Chrome", id: 1 };
+		await session.call("get_window_state", { window: chrome }, { onElicitation: async () => ({ action: "accept", content: { persist: "always" } }) });
+		await session.close();
+		const stored = JSON.parse(await readFile(path.join(stateRoot, "windows-approvals.json"), "utf8"));
+		assert.deepEqual(stored, { version: 1, approvals: { Chrome: "chrome.exe", "chrome.exe": "chrome.exe" } });
+
+		clearSessionApprovals(); // a new process starts without session memory
+		const next = await createOfficialWindowsToolSession({ skipSignatureVerification: true, loadRuntime: async () => runtime, turnIdleMs: 50, configPath });
+		const later = await next.call("get_window_state", { window: chrome }, { onElicitation: neverAsk });
+		assert.equal(later.isError, false);
+		assert.equal(later.elicitationRequests, 0);
+		await next.close();
+	} finally {
+		clearSessionApprovals();
+		await rm(stateRoot, { recursive: true, force: true });
+	}
 });
 
 test("helper rejections are official errors while helper exits are broker failures", async () => {
